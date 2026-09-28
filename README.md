@@ -408,7 +408,8 @@ Análise sobre 96.478 pedidos únicos entregues, após deduplicação por `order
 | voucher | 2.683 | 2,8% | 1,3 | R$ 123,09 |
 | debit_card | 1.484 | 1,5% | 1,0 | R$ 140,41 |
 
-<img width="657" height="332" alt="image" src="https://github.com/user-attachments/assets/b91ea6b1-5109-49d4-a21d-034aeb285c33" />
+<img width="667" height="370" alt="image" src="https://github.com/user-attachments/assets/c25539ff-c217-41ea-b304-7c6b342f41fe" />
+
 
 **Discussão:** o cartão de crédito responde por 75,8% dos pedidos com parcelamento médio de 3,5 vezes, confirmando o comportamento característico do consumidor brasileiro de fracionar compras mesmo em valores moderados. Considerando o ticket médio de R$ 165,67, a parcela típica fica em torno de R$ 47.
 
