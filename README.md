@@ -43,7 +43,7 @@ O dataset é composto por 9 arquivos CSV:
 
 ### Delimitação de Escopo
 
-Duas tabelas foram ingeridas na camada Bronze para preservar a integridade do dataset original, mas não seguiram para as camadas Silver e Gold:
+Duas fontes foram ingeridas na camada Bronze para preservar a integridade do dataset original, mas não seguiram para as camadas Silver e Gold:
 
 - **olist_geolocation_dataset.csv:** contém coordenadas de latitude e longitude por CEP. Como nenhuma das perguntas de negócio exige análise espacial em nível de coordenada, a granularidade de estado disponível em `customers` e `sellers` foi suficiente. Mantida na Bronze para eventual uso futuro.
 - **Campos de texto livre de reviews:** os comentários escritos pelos clientes foram preservados, mas não analisados. A Pergunta 6 utiliza apenas a nota numérica. Análise textual está listada como trabalho futuro.
@@ -68,6 +68,8 @@ O Volume foi criado com as seguintes configurações:
 Após o upload, a leitura e persistência dos arquivos como tabelas Delta na camada Bronze foi realizada via notebook. O script de ingestão está disponível em [`01_bronze_ingestion`](https://github.com/Diogo-Pinto/mvp-pipeline-olist).
 
 **Observação técnica relevante:** a leitura inicial dos CSVs com as opções padrão do Spark gerou desalinhamento de colunas no arquivo de reviews, pois os comentários dos clientes contêm quebras de linha e vírgulas dentro do campo de texto. A ingestão foi corrigida com as opções `multiLine`, `quote` e `escape`, o que reduziu o total de registros de 104.162 para 99.224. A diferença correspondia a registros fantasma criados pela quebra indevida de comentários multilinha. O detalhamento está na seção de Qualidade de Dados.
+
+<img width="900" height="578" alt="image" src="https://github.com/user-attachments/assets/7229b0a1-e2ae-472e-ab95-4d6ded2ce7dc" />
 
 ---
 
@@ -96,6 +98,8 @@ gold_fato_pedidos (112.650 registros, 20 colunas)
     └── Geografia: estado_cliente, cidade_cliente, estado_vendedor
 ```
 
+**Granularidade e implicação analítica:** a tabela tem granularidade de item de pedido. Campos que descrevem o pedido como um todo (`forma_pagamento`, `parcelas`, `valor_total_pedido`) se repetem em cada item do mesmo pedido. Qualquer agregação sobre esses campos exige deduplicação prévia por `order_id`, caso contrário pedidos com muitos itens seriam contados múltiplas vezes. Essa precaução foi aplicada na análise da Pergunta 3.
+
 ### Catálogo de Dados no Unity Catalog
 
 Todas as 18 tabelas do pipeline e as 20 colunas da tabela Gold foram documentadas diretamente no Unity Catalog via comandos `COMMENT ON TABLE` e `ALTER COLUMN ... COMMENT`, tornando o catálogo do Databricks a fonte oficial de documentação. O script está em [`06_catalogo_dados`](https://github.com/Diogo-Pinto/mvp-pipeline-olist).
@@ -122,7 +126,7 @@ Tabela fato central do projeto. Granularidade: um registro por item de pedido.
 | preco_item | double | Preço unitário sem frete. Origem: silver_order_items.price | R$ 0,85 a R$ 6.735,00 |
 | frete | double | Valor do frete do item. Origem: silver_order_items.freight_value | R$ 0,00 a R$ 409,68 |
 | valor_total_item | double | Derivado: soma de preco_item e frete | Calculado |
-| forma_pagamento | string | Forma principal de pagamento. Origem: silver_order_payments, agregado por order_id | credit_card, boleto, voucher, debit_card, not_defined |
+| forma_pagamento | string | Forma principal de pagamento do pedido. Origem: silver_order_payments, agregado por order_id | credit_card, boleto, voucher, debit_card, not_defined |
 | parcelas | integer | Derivado: média de payment_installments por pedido, arredondada | 1 a 24 |
 | valor_total_pedido | double | Derivado: soma de payment_value de todos os pagamentos do pedido | Agregado |
 | estado_cliente | string | UF do cliente. Origem: silver_customers.customer_state, padronizado para maiúsculo | 27 UFs |
@@ -145,7 +149,7 @@ Tabela fato central do projeto. Granularidade: um registro por item de pedido.
 | silver_orders | Silver | Datas convertidas para timestamp, duplicatas removidas | 99.441 |
 | silver_order_items | Silver | Preço e frete tipados, valores inválidos removidos | 112.650 |
 | silver_order_payments | Silver | Valores tipados, registros negativos removidos | 103.886 |
-| silver_order_reviews | Silver | review_score tratado com try_cast, domínio restrito a 1 a 5 | 98.410 |
+| silver_order_reviews | Silver | Deduplicada por review_id, domínio da nota validado | 98.410 |
 | silver_products | Silver | Produtos sem categoria removidos | 32.341 |
 | silver_customers | Silver | Siglas de estado padronizadas | 99.441 |
 | silver_sellers | Silver | Siglas de estado padronizadas | 3.095 |
@@ -168,6 +172,10 @@ O pipeline foi organizado em 6 notebooks independentes, cada um responsável por
 | 06_catalogo_dados | Catálogo | Aplicação das descrições de tabelas e colunas no Unity Catalog |
 
 Todos os notebooks estão disponíveis no repositório: [github.com/Diogo-Pinto/mvp-pipeline-olist](https://github.com/Diogo-Pinto/mvp-pipeline-olist)
+
+<img width="852" height="890" alt="image" src="https://github.com/user-attachments/assets/68368a7d-7575-46a6-a456-cc8235698db7" />
+
+<img width="1202" height="1190" alt="image" src="https://github.com/user-attachments/assets/37f91f18-e175-4681-a045-0f4dd8eece94" />
 
 ### Fluxo do pipeline
 
@@ -205,52 +213,69 @@ Os joins com dimensões usam `left` para preservar todos os itens de pedido mesm
 
 ## Qualidade de Dados (Etapa 4.5)
 
-### Problema crítico detectado na ingestão
+Foram identificados dois problemas reais de qualidade no dataset, além de achados que a inspeção inicial sinalizou como suspeitos mas que se revelaram comportamento legítimo das tabelas.
 
-O achado mais relevante da análise de qualidade não estava no conteúdo dos dados, mas na forma como eram lidos. O arquivo de reviews contém comentários escritos por clientes, campos de texto livre com quebras de linha e vírgulas. Com as opções padrão de leitura de CSV do Spark, cada quebra de linha dentro de um comentário era interpretada como fim de registro, gerando linhas fantasma com colunas desalinhadas.
+### Problema 1: leitura incorreta de campos multilinha (crítico)
 
-O sintoma apareceu como erro de conversão: valores de texto tentando ser convertidos para timestamp, e datas aparecendo no campo de nota da avaliação.
+O achado mais relevante não estava no conteúdo dos dados, mas na forma como eram lidos.
 
-**Correção:** reingestão com as opções `multiLine=true`, `quote` e `escape` configuradas. O total de registros caiu de 104.162 para 99.224, número coerente com os 99.441 pedidos existentes. A diferença de 4.938 registros era integralmente composta por linhas inválidas.
+**Sintoma:** erro de conversão ao tipar o campo `review_score`, com fragmentos de texto aparecendo em colunas de data e datas aparecendo na coluna de nota.
 
-Esse caso ilustra por que a camada Bronze é importante: a correção foi feita na origem do pipeline, e todas as camadas seguintes foram reprocessadas a partir dela sem necessidade de ajustes pontuais.
+**Causa:** o arquivo de reviews contém comentários escritos por clientes, campos de texto livre com quebras de linha e vírgulas. Com as opções padrão de leitura de CSV do Spark, cada quebra de linha dentro de um comentário era interpretada como fim de registro, gerando linhas fantasma com colunas desalinhadas.
 
-### 1. Completude
+**Correção:** reingestão com as opções `multiLine`, `quote` e `escape` configuradas na camada Bronze.
+
+**Impacto:** o total caiu de 104.162 para 99.224 registros. Os 4.938 eliminados eram integralmente linhas inválidas.
+
+**Validação:** após a correção, a verificação de domínio retornou zero valores não conversíveis e zero valores fora da escala de 1 a 5. Os 99.224 registros são integralmente válidos, confirmando que o problema foi eliminado na origem e não apenas mascarado nas camadas seguintes.
+
+Este problema passaria despercebido em uma inspeção superficial de completude ou unicidade, já que as linhas fantasma não eram nulas nem duplicadas. Teria contaminado silenciosamente a análise da Pergunta 6.
+
+### Problema 2: duplicatas em review_id
+
+A tabela `bronze_order_reviews` apresenta 814 duplicatas por `review_id`. Diferente dos casos de granularidade legítima descritos abaixo, este é um problema real: `review_id` deveria ser único por definição, já que representa uma avaliação individual. A presença de duplicatas indica falha de integridade na origem, provavelmente reenvio de formulário ou erro de exportação.
+
+**Tratamento:** deduplicação por `review_id` na camada Silver, resultando em 98.410 registros únicos.
+
+### Completude
 
 | Tabela | Campo | Nulos | % | Tratamento |
 |---|---|---|---|---|
-| bronze_orders | order_approved_at | 160 | 0,16% | Mantido. Pedidos cancelados ou em processamento naturalmente não têm aprovação. |
+| bronze_orders | order_approved_at | 160 | 0,16% | Mantido. Pedidos cancelados ou em processamento não têm aprovação. |
 | bronze_orders | order_delivered_carrier_date | 1.783 | 1,79% | Mantido. Pedidos em trânsito ou cancelados não têm data de coleta. |
 | bronze_orders | order_delivered_customer_date | 2.965 | 2,98% | Mantido. Mesma justificativa. |
 | bronze_products | product_category_name | 610 | 1,85% | Removido na Silver. Produtos sem categoria não contribuem para análises por categoria. |
-| bronze_products | Campos descritivos | 610 | 1,85% | Mantidos. Não utilizados na Gold. |
-| bronze_products | Dimensões físicas | 2 | 0,01% | Mantidos. Não utilizados na Gold. |
+| bronze_products | Campos descritivos e dimensões | 610 a 2 | 1,85% a 0,01% | Mantidos. Não utilizados na Gold. |
+| bronze_order_reviews | review_comment_title | 87.656 | 88,34% | Mantido. Preenchimento opcional na plataforma. |
+| bronze_order_reviews | review_comment_message | 58.247 | 58,70% | Mantido. Preenchimento opcional na plataforma. |
 
-As tabelas `bronze_customers`, `bronze_sellers` e `bronze_category_translation` não apresentaram valores nulos.
+As tabelas `bronze_customers`, `bronze_sellers`, `bronze_category_translation`, `bronze_order_items` e `bronze_order_payments` não apresentaram valores nulos.
 
-### 2. Unicidade
+### Unicidade: distinguindo problema real de granularidade legítima
 
-| Tabela | Chave analisada | Duplicatas | Avaliação |
+| Tabela | Chave | Duplicatas | Avaliação |
 |---|---|---|---|
-| bronze_order_items | order_id | 13.984 | Comportamento esperado. A chave única real é order_id mais order_item_id, pois um pedido pode conter vários itens. |
-| bronze_order_payments | order_id | 4.446 | Comportamento esperado. Um pedido pode ter múltiplas formas de pagamento. Tratado por agregação na Gold. |
+| bronze_order_reviews | review_id | 814 | **Problema real.** Tratado por deduplicação na Silver. |
+| bronze_order_items | order_id | 13.984 | Falso positivo. A chave real é composta (order_id mais order_item_id), pois um pedido contém vários itens. |
+| bronze_order_payments | order_id | 4.446 | Falso positivo. Um pedido pode ter múltiplas formas de pagamento. Tratado por agregação na Gold. |
 | bronze_orders | order_id | 0 | Sem duplicatas. |
 | bronze_customers | customer_id | 0 | Sem duplicatas. |
 | bronze_products | product_id | 0 | Sem duplicatas. |
 | bronze_sellers | seller_id | 0 | Sem duplicatas. |
 
-Vale destacar que as duplicatas encontradas não representam erro de dados. A verificação inicial foi feita sobre `order_id` por ser o campo mais evidente, mas a análise da granularidade de cada tabela mostrou que a chave primária real é composta nos dois casos.
+A verificação inicial foi feita sobre o primeiro campo identificador de cada tabela, que é a abordagem automatizável, mas a interpretação exigiu entender a granularidade real de cada uma. Tratar os 13.984 registros de `order_items` como duplicatas e removê-los teria destruído a informação de itens múltiplos por pedido.
 
-### 3. Acurácia
+### Acurácia
 
 - Nenhum preço negativo ou zerado em `order_items`.
-- Frete mínimo de R$ 0,00: considerado válido, representa frete grátis ou promoção.
-- Preço máximo de R$ 6.735,00: plausível para eletrônicos ou itens premium, não caracteriza outlier espúrio.
-- 3 registros com `payment_type` igual a "not_defined" (0,003% do total): volume irrelevante, mantidos na Silver e excluídos apenas na análise da Pergunta 3.
+- Frete mínimo de R$ 0,00: válido, representa frete grátis ou promoção.
+- Preço máximo de R$ 6.735,00: plausível para eletrônicos ou itens premium.
+- 3 registros com `payment_type` igual a "not_defined" (0,003% do total): mantidos na Silver, excluídos apenas na análise da Pergunta 3.
 - Nenhum valor de pagamento negativo.
-- Campo `review_score` com valores fora do domínio após a correção de leitura: tratados na Silver com `try_cast` e filtro para o intervalo válido de 1 a 5, resultando em 98.410 registros válidos.
+- Campo `review_score` integralmente dentro do domínio válido após a correção de ingestão. Distribuição na Bronze: 11.424 notas 1, 3.151 notas 2, 8.179 notas 3, 19.142 notas 4 e 57.328 notas 5.
+- O `try_cast` aplicado na Silver foi mantido como salvaguarda defensiva, garantindo que eventuais valores malformados em cargas futuras não interrompam o pipeline.
 
-### 4. Consistência
+### Consistência
 
 - Siglas de estado de clientes e vendedores padronizadas para maiúsculo na Silver, prevenindo inconsistências como "sp" contra "SP".
 - Colunas de data convertidas de string para timestamp na Silver, viabilizando operações temporais corretas nas análises.
@@ -260,7 +285,7 @@ Vale destacar que as duplicatas encontradas não representam erro de dados. A ve
 
 ## Análise de Dados (Etapa 4.5)
 
-Todas as análises consideram apenas pedidos com status `delivered`, totalizando 110.197 itens. Essa decisão garante que as métricas reflitam compras efetivamente concluídas, excluindo pedidos cancelados ou indisponíveis que distorceriam os valores de receita.
+Todas as análises consideram apenas pedidos com status `delivered`, totalizando 110.197 itens distribuídos em 96.478 pedidos únicos. Essa decisão garante que as métricas reflitam compras efetivamente concluídas, excluindo pedidos cancelados ou indisponíveis que distorceriam os valores de receita.
 
 ### Pergunta 1: Quais categorias concentram maior volume de pedidos e receita?
 
@@ -279,6 +304,8 @@ Todas as análises consideram apenas pedidos com status `delivered`, totalizando
 | garden_tools | 4.268 | R$ 470.495,28 | R$ 110,24 |
 | auto | 4.140 | R$ 578.966,65 | R$ 139,85 |
 
+<img width="610" height="457" alt="image" src="https://github.com/user-attachments/assets/8c539eb9-f85f-4119-8784-53a13e1fcc7b" />
+
 **Top 10 por receita:**
 
 | Categoria | Receita Total | Volume de Itens | Ticket Médio |
@@ -294,11 +321,15 @@ Todas as análises consideram apenas pedidos com status `delivered`, totalizando
 | auto | R$ 578.966,65 | 4.140 | R$ 139,85 |
 | toys | R$ 471.286,48 | 4.030 | R$ 116,94 |
 
-**Discussão:** os dois rankings divergem de forma reveladora. Cama, mesa e banho lidera em volume com 10.953 itens, mas cai para terceiro em receita. Relógios e presentes faz o movimento oposto: sétimo em volume, segundo em receita, sustentado pelo ticket médio de R$ 199, o maior entre as categorias de alto volume. A categoria `cool_stuff` sequer aparece no top 10 de volume mas figura em oitavo lugar em receita.
+<img width="610" height="360" alt="image" src="https://github.com/user-attachments/assets/671eaed4-4da1-4a80-a607-f5c1fffc19c8" />
+
+**Discussão:** os dois rankings divergem de forma reveladora. Cama, mesa e banho lidera em volume com 10.953 itens, mas cai para terceiro em receita. Relógios e presentes faz o movimento oposto: sétimo em volume, segundo em receita, sustentado pelo ticket médio de R$ 199,04, o maior entre as categorias de alto volume. A categoria `cool_stuff` sequer aparece no top 10 de volume mas figura em oitavo lugar em receita.
 
 A implicação prática é que uma estratégia de marketplace focada apenas em volume de transações subestimaria categorias de alto valor unitário. Para a Olist, que cobra comissão sobre valor transacionado, categorias como relógios e presentes são desproporcionalmente relevantes em relação ao seu volume.
 
 ### Pergunta 2: Qual o ticket médio por categoria e como varia entre regiões?
+
+A análise foi conduzida em três dimensões: por região, por categoria e no cruzamento entre ambas.
 
 **2a. Ticket médio por região:**
 
@@ -309,6 +340,8 @@ A implicação prática é que uma estratégia de marketplace focada apenas em v
 | Centro-Oeste | R$ 130,85 | 6.375 | R$ 834.169,41 |
 | Sul | R$ 120,00 | 15.647 | R$ 1.877.578,61 |
 | Sudeste | R$ 114,36 | 74.682 | R$ 8.540.290,22 |
+
+<img width="588" height="347" alt="image" src="https://github.com/user-attachments/assets/b20e7fa9-afd3-44fa-99f3-122408c6961f" />
 
 **2b. Ticket médio por categoria (mínimo 100 itens vendidos):**
 
@@ -327,6 +360,8 @@ Maiores tickets:
 | furniture_bedroom | R$ 184,97 | 103 | R$ 19.051,80 |
 | air_conditioning | R$ 184,51 | 289 | R$ 53.323,56 |
 
+<img width="655" height="488" alt="image" src="https://github.com/user-attachments/assets/effb004f-91e4-403a-8cd2-2a589c1c5f6c" />
+
 Menores tickets:
 
 | Categoria | Ticket Médio | Volume | Receita Total |
@@ -342,6 +377,8 @@ Menores tickets:
 | fashion_bags_accessories | R$ 75,23 | 1.985 | R$ 149.329,39 |
 | fashion_male_clothing | R$ 83,62 | 125 | R$ 10.452,33 |
 
+<img width="643" height="365" alt="image" src="https://github.com/user-attachments/assets/3aa966be-4b81-41e2-a0e8-17de9cdda425" />
+
 **2c. Cruzamento categoria x região (ticket médio em R$):**
 
 | Categoria | Norte | Nordeste | Centro-Oeste | Sudeste | Sul |
@@ -352,26 +389,34 @@ Menores tickets:
 | health_beauty | 198,49 | 176,34 | 135,03 | 120,46 | 125,40 |
 | sports_leisure | 160,62 | 128,91 | 110,73 | 109,54 | 115,92 |
 
-**Discussão:** a visão por categoria mostra amplitude enorme, de R$ 55 em alimentos e bebidas a R$ 1.098 em computadores, uma razão de vinte vezes. Categorias de baixo ticket tendem a ser de consumo recorrente e baixo envolvimento na decisão de compra, enquanto as de alto ticket concentram bens duráveis.
+<img width="1180" height="398" alt="image" src="https://github.com/user-attachments/assets/d778d103-8ffd-48e7-a3c1-03a93b16e64f" />
 
-O cruzamento da seção 2c é o achado mais relevante desta análise. A hipótese inicial ao observar o ticket médio regional era que as regiões Norte e Nordeste comprassem categorias diferentes, mais caras. O pivot desmente isso: **dentro da mesma categoria**, o ticket médio no Norte é sistematicamente superior ao do Sudeste. Em saúde e beleza a diferença chega a 65% (R$ 198,49 contra R$ 120,46). O padrão se repete nas cinco categorias analisadas, sem exceção.
+**Discussão:** a visão por categoria mostra amplitude enorme, de R$ 55,55 em alimentos e bebidas a R$ 1.098,92 em computadores, uma razão de vinte vezes. Categorias de baixo ticket tendem a ser de consumo recorrente e baixo envolvimento na decisão de compra, enquanto as de alto ticket concentram bens duráveis.
+
+O cruzamento da seção 2c é o achado mais relevante desta análise. A hipótese natural ao observar o ticket médio regional era que as regiões Norte e Nordeste comprassem categorias diferentes, mais caras. O pivot desmente isso: **dentro da mesma categoria**, o ticket médio no Norte é sistematicamente superior ao do Sudeste. Em saúde e beleza a diferença chega a 65% (R$ 198,49 contra R$ 120,46). O padrão se repete nas cinco categorias analisadas, sem exceção.
 
 Isso significa que a diferença regional não é efeito de composição de mix de produtos, mas de comportamento de compra. Duas explicações são plausíveis e não mutuamente exclusivas: consumidores em regiões com menor oferta de varejo físico recorrem ao e-commerce para compras de maior valor, que justificam o frete e o prazo de entrega mais longos; ou compram em maior quantidade por transação para diluir o custo logístico. Ambas apontam para a mesma conclusão de negócio, que é a de que o custo de aquisição de cliente nessas regiões pode ser compensado por um valor por transação significativamente maior.
 
 ### Pergunta 3: Quais formas de pagamento são mais usadas e qual o parcelamento médio?
 
-| Forma de Pagamento | Volume | Média de Parcelas | Ticket Médio do Pedido |
-|---|---|---|---|
-| credit_card | 83.253 | 3,6 | R$ 182,67 |
-| boleto | 22.362 | 1,0 | R$ 176,33 |
-| voucher | 2.927 | 1,3 | R$ 129,47 |
-| debit_card | 1.652 | 1,0 | R$ 149,32 |
+Análise sobre 96.478 pedidos únicos entregues, após deduplicação por `order_id`, já que forma de pagamento e parcelamento são atributos do pedido e não do item.
 
-**Discussão:** o cartão de crédito responde por 75% das transações com parcelamento médio de 3,6 vezes, confirmando o comportamento característico do consumidor brasileiro de fracionar compras mesmo em valores moderados. Considerando o ticket médio de R$ 182, a parcela típica fica em torno de R$ 50.
+| Forma de Pagamento | Pedidos | Participação | Média de Parcelas | Ticket Médio |
+|---|---|---|---|---|
+| credit_card | 73.119 | 75,8% | 3,5 | R$ 165,67 |
+| boleto | 19.191 | 19,9% | 1,0 | R$ 144,33 |
+| voucher | 2.683 | 2,8% | 1,3 | R$ 123,09 |
+| debit_card | 1.484 | 1,5% | 1,0 | R$ 140,41 |
 
-O dado mais contraintuitivo é o boleto. A expectativa seria que fosse usado predominantemente em compras de baixo valor, dado que não permite parcelamento. No entanto, seu ticket médio de R$ 176 é praticamente equivalente ao do cartão. Isso sugere que a escolha pelo boleto não é determinada pelo valor da compra, mas por perfil de consumidor, provavelmente clientes sem acesso a crédito ou que preferem evitar o uso do cartão. Para o marketplace, isso significa que restringir ou desincentivar o boleto teria impacto direto em receita, não apenas em transações de baixo valor.
+<img width="657" height="332" alt="image" src="https://github.com/user-attachments/assets/b91ea6b1-5109-49d4-a21d-034aeb285c33" />
 
-O cartão de débito representa apenas 1,5% das transações, refletindo o período analisado, anterior à popularização de meios de pagamento instantâneo no Brasil.
+**Discussão:** o cartão de crédito responde por 75,8% dos pedidos com parcelamento médio de 3,5 vezes, confirmando o comportamento característico do consumidor brasileiro de fracionar compras mesmo em valores moderados. Considerando o ticket médio de R$ 165,67, a parcela típica fica em torno de R$ 47.
+
+O boleto ocupa quase 20% dos pedidos com ticket médio de R$ 144,33, cerca de 13% abaixo do cartão. A diferença existe mas é menor do que se esperaria de um meio de pagamento que não permite parcelamento. A leitura mais provável é que a escolha pelo boleto reflete perfil de acesso a crédito, provavelmente clientes sem cartão ou que preferem evitá-lo, e não apenas o valor da compra. Para o marketplace, isso significa que o boleto sustenta uma fatia relevante de receita e não pode ser tratado como canal marginal de transações pequenas.
+
+O cartão de débito representa apenas 1,5% dos pedidos, refletindo o período analisado, anterior à popularização de meios de pagamento instantâneo no Brasil.
+
+**Nota metodológica:** a primeira versão desta análise agregava diretamente sobre a granularidade de item, o que inflava a contagem de pedidos e elevava artificialmente o ticket médio, já que pedidos com muitos itens eram contados múltiplas vezes e têm valor total maior. A deduplicação por `order_id` corrigiu a distorção. O caso ilustra como a granularidade da tabela fato precisa ser considerada em cada agregação.
 
 ### Pergunta 4: Como o volume de pedidos evoluiu ao longo dos meses?
 
@@ -398,11 +443,15 @@ O cartão de débito representa apenas 1,5% das transações, refletindo o perí
 | 2018 | 7 | 6.159 | R$ 867.953,46 |
 | 2018 | 8 | 6.351 | R$ 838.576,64 |
 
+<img width="540" height="712" alt="image" src="https://github.com/user-attachments/assets/1240d6a1-6272-4c50-8bc0-d62a9ec32008" />
+
 **Discussão:** o ano de 2017 mostra crescimento acelerado e consistente, com o volume mensal multiplicando-se por quase dez vezes entre janeiro (750 pedidos) e novembro (7.289). O pico de novembro é quase certamente efeito de Black Friday, e a queda subsequente em dezembro para 5.513 pedidos sugere antecipação de compras de fim de ano.
 
 O comportamento em 2018 é qualitativamente diferente. O volume se estabiliza na faixa de 6.000 a 7.000 pedidos mensais, sem tendência clara de crescimento. Dois pontos merecem atenção: primeiro, o patamar de janeiro de 2018 (7.069) é superior ao de dezembro de 2017, o que indica que o crescimento de novembro não foi apenas sazonal mas incorporou base de clientes de forma permanente. Segundo, a estabilização pode indicar tanto maturidade de mercado quanto limitação de capacidade operacional, hipótese que exigiria dados adicionais para ser testada.
 
 A receita acompanha o volume com proporcionalidade, sugerindo que o ticket médio permaneceu estável ao longo do período, sem inflação de preços ou mudança significativa de mix.
+
+**Delimitação:** a série termina em agosto de 2018 porque o dataset se encerra em setembro daquele ano, e o mês final está incompleto. Os meses de setembro a dezembro de 2016 foram excluídos por conterem volume residual, que corresponde ao período inicial de operação da plataforma.
 
 ### Pergunta 5: Quais estados têm maior concentração de clientes?
 
@@ -419,9 +468,11 @@ A receita acompanha o volume com proporcionalidade, sugerindo que o ticket médi
 | ES | 1.995 | 1.995 | R$ 268.643,45 |
 | GO | 1.957 | 1.957 | R$ 282.836,70 |
 
+<img width="658" height="497" alt="image" src="https://github.com/user-attachments/assets/3f2ac2dd-7d34-454f-809b-58330b713c28" />
+
 **Discussão:** São Paulo concentra 40.501 clientes, mais do que Rio de Janeiro e Minas Gerais somados. Os três estados do Sudeste representam aproximadamente 58% da base, refletindo a concentração econômica e populacional brasileira, mas também possivelmente a concentração de vendedores da plataforma, que reduz custo e prazo de frete para compradores próximos.
 
-Um detalhe metodológico relevante: o número de clientes é idêntico ao de pedidos em todos os estados. Isso ocorre porque no dataset da Olist o campo `customer_id` é gerado por pedido, não por pessoa. A identificação de cliente recorrente exigiria o campo `customer_unique_id`, disponível na tabela original mas não incorporado a esta modelagem. Consequentemente, esta análise mede concentração de transações por estado, não de indivíduos distintos. A correção dessa limitação está listada como trabalho futuro.
+**Limitação metodológica:** o número de clientes é idêntico ao de pedidos em todos os estados. Isso ocorre porque no dataset da Olist o campo `customer_id` é gerado por pedido, não por pessoa. A identificação de cliente recorrente exigiria o campo `customer_unique_id`, disponível na tabela original mas não incorporado a esta modelagem. Consequentemente, esta análise mede concentração de transações por estado, não de indivíduos distintos. A correção está listada como trabalho futuro.
 
 Combinando com a Pergunta 2, emerge o padrão central deste MVP: o Sudeste domina em volume absoluto, enquanto Norte e Nordeste apresentam maior valor por transação. São estratégias comerciais distintas para mercados distintos.
 
@@ -435,6 +486,8 @@ Combinando com a Pergunta 2, emerge o padrão central deste MVP: o Sudeste domin
 | 4 | 18.861 | R$ 132,36 | R$ 0,85 | R$ 4.690,00 |
 | 5 | 56.664 | R$ 134,66 | R$ 0,85 | R$ 6.735,00 |
 
+<img width="711" height="356" alt="image" src="https://github.com/user-attachments/assets/bdf49377-d856-45b6-b593-9732ef00aa4a" />
+
 **Discussão:** existe relação, mas não é linear. Pedidos com nota 1 apresentam o maior valor médio de todos (R$ 164,87), enquanto as notas 2 a 5 se concentram numa faixa estreita entre R$ 127 e R$ 143. O padrão não é de correlação contínua, é de concentração de insatisfação severa nas compras de maior valor.
 
 A explicação mais provável envolve assimetria de expectativa e de risco. Compras caras geram expectativa proporcionalmente maior, e qualquer falha de entrega ou divergência de produto tem consequência mais grave para o comprador. Além disso, itens de maior valor tendem a ser maiores fisicamente, o que aumenta a probabilidade de avaria no transporte e de atraso logístico.
@@ -443,17 +496,19 @@ O valor máximo na nota 1 (R$ 13.440,00) é o maior de toda a base, superando in
 
 Do ponto de vista de negócio, a distribuição de volume é tranquilizadora: 56.664 pedidos com nota 5 contra 9.292 com nota 1, uma proporção de seis para um. A experiência majoritária é positiva. O problema é específico e endereçável, concentrado no segmento de alto ticket, e sugere que investimento em acompanhamento logístico diferenciado para pedidos acima de determinado valor teria retorno direto em satisfação.
 
+**Delimitação importante:** esta análise usa apenas pedidos com status `delivered`, o que significa que mede satisfação entre clientes que efetivamente receberam o produto. A distribuição de notas na camada Bronze, que inclui pedidos não entregues, é menos favorável: 11.424 notas 1 contra os 9.292 aqui reportados. A diferença sugere que avaliações de pedidos cancelados ou não entregues concentram notas baixas, o que é intuitivo. A conclusão sobre a relação entre valor e insatisfação permanece válida, mas o nível geral de satisfação medido aqui é otimista em relação à experiência completa da base.
+
 ### Conclusão Geral
 
 O pipeline revelou um marketplace em transição entre fase de crescimento acelerado (2017) e consolidação (2018), com três padrões estruturais claros.
 
 O primeiro é a dissociação entre volume e valor na dimensão geográfica. O Sudeste concentra 68% dos itens e 70% da receita, mas apresenta o menor ticket médio do país. Norte e Nordeste invertem a relação, e o cruzamento por categoria confirmou que isso é comportamento de compra, não mix de produtos. A mesma categoria custa sistematicamente mais nessas regiões.
 
-O segundo é a centralidade do crédito parcelado. Três quartos das transações passam por cartão de crédito com parcelamento médio de 3,6 vezes, mas o boleto sustenta ticket médio equivalente, indicando que o meio de pagamento reflete perfil de acesso a crédito e não valor da compra.
+O segundo é a centralidade do crédito parcelado. Três quartos dos pedidos passam por cartão de crédito com parcelamento médio de 3,5 vezes, enquanto o boleto sustenta quase 20% do volume com ticket médio apenas 13% inferior, indicando que o meio de pagamento reflete perfil de acesso a crédito mais do que valor da compra.
 
 O terceiro é a concentração de insatisfação no alto ticket. Pedidos com avaliação mínima têm valor médio 22% superior à média geral, apontando uma lacuna específica de experiência em compras de maior valor.
 
-Do ponto de vista de Engenharia de Dados, o exercício reforçou que a qualidade do pipeline se define na camada mais próxima da origem. O problema de leitura multilinha nos reviews passaria despercebido em uma inspeção superficial e teria contaminado silenciosamente todas as análises subsequentes. Foi a estrutura em camadas que permitiu corrigir na origem e reprocessar sem retrabalho.
+Do ponto de vista de Engenharia de Dados, o exercício reforçou duas lições. A qualidade do pipeline se define na camada mais próxima da origem: o problema de leitura multilinha nos reviews passaria despercebido em uma inspeção superficial e teria contaminado silenciosamente todas as análises subsequentes. E a granularidade da tabela fato precisa ser considerada em cada agregação: a análise de formas de pagamento produziu números plausíveis mas incorretos até que a deduplicação por pedido fosse aplicada. Nos dois casos, o erro não gerava exceção, apenas resultados errados.
 
 ---
 
@@ -469,7 +524,7 @@ Considero que o resultado mais valioso do trabalho não foram as respostas em si
 
 A maior dificuldade foi conceitual, não técnica. Sendo minha primeira experiência com Databricks, Spark e arquitetura Lakehouse, a curva inicial envolveu entender por que cada camada existe antes de conseguir implementá-las com propósito. A tentação inicial era pular direto da ingestão para a análise, e foi preciso disciplina para respeitar a separação de responsabilidades.
 
-Tecnicamente, três pontos exigiram esforço:
+Tecnicamente, três pontos exigiram esforço.
 
 A configuração do ambiente, especialmente a criação de volumes no Unity Catalog e a integração com GitHub via Databricks Repos, consumiu tempo por diferenças entre a documentação oficial e a interface da Free Edition.
 
@@ -477,22 +532,33 @@ A sintaxe do PySpark difere substancialmente do Pandas, que é a referência mai
 
 O problema de leitura dos reviews foi o mais instrutivo. O erro inicial apontava para um cast inválido, mas a causa real estava duas camadas acima, na forma como o CSV era interpretado. Diagnosticar isso exigiu entender que o sintoma e a causa podem estar distantes no pipeline, e que corrigir o sintoma teria propagado dados incorretos silenciosamente.
 
+### Erros cometidos e corrigidos
+
+Dois erros merecem registro porque ambos produziam resultados plausíveis, o que os torna mais perigosos do que erros que geram exceção.
+
+O primeiro foi a leitura padrão do CSV de reviews, que gerou 4.938 registros corrompidos. O pipeline executava sem erro até o momento em que uma conversão de tipo falhou, várias etapas adiante.
+
+O segundo foi a agregação da Pergunta 3 diretamente sobre a granularidade de item. Os números resultantes eram internamente consistentes e pareciam corretos, mas contavam pedidos múltiplas vezes e inflavam o ticket médio. Só percebi ao cruzar o total com a contagem de pedidos entregues da camada Bronze, que não batia.
+
+A lição comum aos dois é que validação cruzada entre camadas é mais confiável do que inspeção isolada de resultados.
+
 ### Limitações reconhecidas
 
-Três limitações merecem registro explícito.
-
-A análise de clientes na Pergunta 5 mede transações, não pessoas, pois o campo `customer_unique_id` não foi incorporado à modelagem. Só percebi isso ao interpretar os resultados, quando a igualdade exata entre número de clientes e de pedidos chamou atenção.
+A análise de clientes na Pergunta 5 mede transações, não pessoas, pois o campo `customer_unique_id` não foi incorporado à modelagem. Percebi isso ao interpretar os resultados, quando a igualdade exata entre número de clientes e de pedidos chamou atenção.
 
 A tabela de geolocalização foi ingerida mas não utilizada, o que representa trabalho de ingestão sem retorno analítico. Foi decisão consciente de escopo, mas em um cenário profissional teria sido melhor avaliar isso antes da coleta.
 
-Os comentários textuais das avaliações, que são provavelmente o dado mais rico do dataset para entender as notas baixas, permaneceram intocados.
+Os comentários textuais das avaliações, provavelmente o dado mais rico do dataset para entender as notas baixas, permaneceram intocados.
+
+A análise da Pergunta 6 mede satisfação apenas entre pedidos entregues, o que produz um retrato mais favorável do que a experiência completa da base de clientes.
 
 ### Trabalhos futuros
 
 - Incorporar `customer_unique_id` para distinguir clientes recorrentes de novos e analisar taxa de recompra, o que permitiria calcular valor de tempo de vida do cliente
 - Aplicar processamento de linguagem natural sobre os comentários das avaliações para identificar os motivos declarados das notas baixas, complementando o achado da Pergunta 6
+- Estender a análise de satisfação para incluir pedidos não entregues, separando insatisfação com o produto de insatisfação com a logística
 - Utilizar a tabela de geolocalização para análise espacial de distância entre vendedor e comprador, testando a hipótese de que o ticket médio regional se relaciona com custo logístico
 - Automatizar a execução do pipeline com Databricks Workflows, encadeando os notebooks com dependências explícitas
 - Construir dashboard no Databricks SQL conectado à camada Gold, substituindo a leitura de outputs em notebook
 - Separar as camadas em schemas distintos (`bronze`, `silver`, `gold`) em vez de prefixos de nomenclatura, aproximando a organização do padrão adotado em ambientes produtivos
-- Implementar testes de qualidade automatizados com expectativas declarativas, transformando a análise manual da etapa 4.5 em validação contínua a cada execução
+- Implementar testes de qualidade automatizados com expectativas declarativas, incluindo validação de contagem entre camadas, transformando a análise manual da etapa 4.5 em validação contínua a cada execução
